@@ -6,7 +6,8 @@ from torch.utils.data import DataLoader, Subset
 from torchvision.transforms import PILToTensor
 from PIL import Image
 import torch.nn.functional as TF
-import torchvision.transforms.functional as T
+import torchvision.transforms as T
+import torchvision.transforms.functional as F
 from argparse import ArgumentParser
 
 parser = ArgumentParser()
@@ -14,8 +15,9 @@ parser.add_argument("-image_height", type=int, default=32)
 parser.add_argument("-image_width", type=int, default=32)
 parser.add_argument("-latent_dim", type=int, default=32)
 parser.add_argument("-epochs", type=int, default=100)
-parser.add_argument("-batch_size", type=int, default=16)
+parser.add_argument("-batch_size", type=int, default=128)
 parser.add_argument("-learning_rate", type=float, default=5e-4)
+parser.add_argument("-generator_training_frequency", type=int, default=10)
 args = parser.parse_args()
 
 
@@ -42,33 +44,62 @@ class Generator(nn.Module):
         x = TF.relu(self.deconv2(x))
         x = TF.relu(self.deconv3(x))
         x = TF.relu(self.deconv4(x))
-        x = TF.relu(self.deconv5(x))
-        return TF.sigmoid(x)
+        x = TF.sigmoid(self.deconv5(x))
+        return x
+
+
+class LinearGenerator(nn.Module):
+    def __init__(self, latent_dim, image_height=32, image_width=32) -> None:
+        super().__init__()
+        self.image_height = image_height
+        self.image_width = image_width
+        self.l1 = nn.Linear(latent_dim, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.l2 = nn.Linear(128, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.l3 = nn.Linear(256, 512)
+        self.bn3 = nn.BatchNorm1d(512)
+        self.l4 = nn.Linear(512, 3*image_height*image_width)
+        self.bn4 = nn.BatchNorm1d(3*image_height*image_width)
+
+    def forward(self, x):
+        x = TF.relu(self.bn1(self.l1(x)))
+        x = TF.relu(self.bn2(self.l2(x)))
+        x = TF.relu(self.bn3(self.l3(x)))
+        x = TF.sigmoid(self.bn4(self.l4(x)))
+        x = x.reshape(-1, 3, self.image_height, self.image_width)
+        return x
 
 
 class Discriminator(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=5, kernel_size=3)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3)
+        self.bn1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(
-            in_channels=5, out_channels=13, kernel_size=3, stride=2)
-        self.conv3 = nn.Conv2d(in_channels=13, out_channels=34, kernel_size=3)
+            in_channels=64, out_channels=128, kernel_size=3, stride=2)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(
+            in_channels=128, out_channels=256, kernel_size=3)
+        self.bn3 = nn.BatchNorm2d(256)
         self.conv4 = nn.Conv2d(
-            in_channels=34, out_channels=55, kernel_size=3, stride=2)
-        self.fc = nn.Linear(in_features=55*25, out_features=2)
+            in_channels=256, out_channels=256, kernel_size=3, stride=2)
+        self.bn4 = nn.BatchNorm2d(256)
+        self.fc = nn.Linear(in_features=256*25, out_features=2)
 
     def forward(self, x):
-        x = TF.relu(self.conv1(x))
-        x = TF.relu(self.conv2(x))
-        x = TF.relu(self.conv3(x))
-        x = TF.relu(self.conv4(x))
+        x = TF.relu(self.bn1(self.conv1(x)))
+        x = TF.relu(self.bn2(self.conv2(x)))
+        x = TF.relu(self.bn3(self.conv3(x)))
+        x = TF.relu(self.bn4(self.conv4(x)))
         x = x.flatten(start_dim=1)
         return self.fc(x)
 
 
-dataset = CIFAR10(root="./data", download=False, transform=PILToTensor())
-dataloader = DataLoader(dataset, args.batch_size)
-generator = Generator(args.latent_dim)
+dataset = CIFAR10(root="./data", download=False,
+                  transform=T.Compose([PILToTensor(), T.ConvertImageDtype(torch.float32)]))
+dataloader = DataLoader(dataset, args.batch_size, drop_last=True)
+generator = LinearGenerator(args.latent_dim)
 discriminator = Discriminator()
 
 generator_optimizer = torch.optim.Adam(
@@ -80,7 +111,7 @@ generator_loss_function = nn.CrossEntropyLoss()
 discriminator_loss_function = nn.CrossEntropyLoss()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 generator.to(DEVICE)
-
+discriminator.to(DEVICE)
 num_gen_parameters = sum([param.numel() for param in generator.parameters()])
 num_dis_parameters = sum([param.numel()
                          for param in discriminator.parameters()])
@@ -95,19 +126,36 @@ for e in range(args.epochs):
     for i, (images, _) in enumerate(dataloader):
         images = images.to(DEVICE)
         discriminator.eval()
-        gen_latents = torch.randn(size=(args.batch_size, args.latent_dim))
-        fake_images = generator(gen_latents)
-        fake_labels = torch.ones(
-            size=(args.batch_size,), dtype=torch.int64, device=DEVICE)
-        generator_score = discriminator(fake_images)
-        generator_loss = generator_loss_function(generator_score, fake_labels)
-        generator_optimizer.zero_grad()
-        generator_loss.backward()
-        generator_optimizer.step()
+        generator.train()
+
+        for p in generator.parameters():
+            p.requires_grad = True
+        for p in discriminator.parameters():
+            p.requires_grad = False
+        for f in range(args.generator_training_frequency):
+            gen_latents = torch.randn(
+                size=(args.batch_size, args.latent_dim), device=DEVICE)
+            fake_images = generator(gen_latents)
+            fake_labels = torch.ones(
+                size=(args.batch_size,), dtype=torch.int64, device=DEVICE)
+            for p in discriminator.parameters():
+                p.requires_grad = False
+            generator_score = discriminator(fake_images)
+            generator_loss = generator_loss_function(
+                generator_score, fake_labels)
+            generator_optimizer.zero_grad()
+            generator_loss.backward()
+            generator_optimizer.step()
 
         # train discriminator
         generator.eval()
-        dis_latents = torch.randn(size=(args.batch_size, args.latent_dim))
+        discriminator.train()
+        for p in generator.parameters():
+            p.requires_grad = False
+        for p in discriminator.parameters():
+            p.requires_grad = True
+        dis_latents = torch.randn(
+            size=(args.batch_size, args.latent_dim), device=DEVICE)
         fake_images = generator(dis_latents)
         fake_labels = torch.zeros(
             size=(args.batch_size,), dtype=torch.int64, device=DEVICE)
@@ -121,3 +169,11 @@ for e in range(args.epochs):
         discriminator_optimizer.zero_grad()
         discriminator_loss.backward()
         discriminator_optimizer.step()
+        if i % 100 == 0:
+            for j, image in enumerate(fake_images):
+                if j > 15:
+                    break
+                image = F.to_pil_image(image)
+                plt.subplot(4, 4, j+1)
+                plt.imshow(image)
+            plt.show()
