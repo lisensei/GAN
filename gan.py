@@ -8,8 +8,10 @@ from PIL import Image
 import torch.nn.functional as TF
 import torchvision.transforms as T
 import torchvision.transforms.functional as F
+import sys
 from argparse import ArgumentParser
-
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 parser = ArgumentParser()
 parser.add_argument("-image_height", type=int, default=32)
 parser.add_argument("-image_width", type=int, default=32)
@@ -18,7 +20,14 @@ parser.add_argument("-epochs", type=int, default=100)
 parser.add_argument("-batch_size", type=int, default=128)
 parser.add_argument("-learning_rate", type=float, default=5e-4)
 parser.add_argument("-generator_training_frequency", type=int, default=10)
+parser.add_argument("-logdir", type=str, default="runs")
 args = parser.parse_args()
+
+if sys.platform[:3] == "win":
+    run_time = datetime.now().isoformat(timespec="seconds").replace(":", "-")
+else:
+    run_time = datetime.now().isoformat(timespec="seconds")
+writer = SummaryWriter(log_dir=f"{args.logdir}/{run_time}")
 
 
 class Generator(nn.Module):
@@ -121,6 +130,7 @@ for k, v in args.__dict__.items():
 
 print(f"number of generator parameters: {num_gen_parameters}")
 print(f"number of discriminator parameters: {num_dis_parameters}")
+plt.figure(1)
 for e in range(args.epochs):
     # train generator
     for i, (images, _) in enumerate(dataloader):
@@ -169,11 +179,13 @@ for e in range(args.epochs):
         discriminator_optimizer.zero_grad()
         discriminator_loss.backward()
         discriminator_optimizer.step()
-        if i % 100 == 0:
-            for j, image in enumerate(fake_images):
-                if j > 15:
-                    break
-                image = F.to_pil_image(image)
-                plt.subplot(4, 4, j+1)
-                plt.imshow(image)
-            plt.show()
+    for j, image in enumerate(fake_images):
+        if j > 15:
+            break
+        image = F.to_pil_image(image)
+        plt.subplot(4, 4, j+1)
+        plt.imshow(image)
+        plt.axis("off")
+    writer.add_figure("generations", plt.figure(1), e)
+    plt.clf()
+    print(f"epoch: {e}")
